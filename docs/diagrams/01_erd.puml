@@ -1,0 +1,109 @@
+@startuml
+title Deal Ledger - current SQLite schema (source verified 2026-10-08)
+hide circle
+skinparam linetype ortho
+skinparam shadowing false
+skinparam entityBackgroundColor #F3F7FC
+
+entity "ledger_accounts" as ledger_accounts {
+  mt5_account_id : TEXT <<PK>>
+  * broker_namespace : TEXT
+  * server : TEXT
+  * login : TEXT
+  * company_observed : TEXT
+  * trade_mode : INTEGER
+  --
+  UNIQUE (broker_namespace, server, login)
+}
+
+entity "deals" as deals {
+  id : TEXT <<PK>>
+  * mt5_account_id : TEXT <<FK>>
+  * deal_ticket : TEXT
+  * order_ticket : TEXT
+  * position_id : TEXT
+  * symbol : TEXT
+  * deal_type : INTEGER
+  * deal_entry : INTEGER
+  * magic : TEXT
+  * volume : TEXT
+  * price : TEXT
+  * commission : TEXT
+  * swap : TEXT
+  * profit : TEXT
+  * broker_fee : TEXT
+  * broker_time_seconds : INTEGER
+  * executed_at_msc : INTEGER
+  reason : INTEGER
+  sl : TEXT
+  tp : TEXT
+  comment : TEXT
+  external_id : TEXT
+  * raw_payload : TEXT
+  * payload_hash : TEXT
+  * normalizer_version : INTEGER
+  * first_seen_at : TEXT
+  * ingestion_id : TEXT
+  --
+  UNIQUE (mt5_account_id, deal_ticket)
+  INDEX idx_deals_order (mt5_account_id, order_ticket)
+  INDEX idx_deals_position (mt5_account_id, position_id)
+}
+
+entity "deal_observations" as deal_observations {
+  id : TEXT <<PK>>
+  * deal_id : TEXT <<FK>>
+  * payload_hash : TEXT
+  * raw_payload : TEXT
+  * observed_at : TEXT
+  * ingestion_id : TEXT
+  * normalizer_version : INTEGER
+  --
+  UNIQUE (deal_id, payload_hash)
+}
+
+ledger_accounts ||--o{ deals : mt5_account_id
+deals ||--o{ deal_observations : deal_id
+
+note left of ledger_accounts
+  AccountRef uses a caller-supplied stable UUID.
+  Identity = broker_namespace + server + login.
+  Only company_observed and trade_mode are updated
+  by register_account; they are observed metadata.
+  No credential columns.
+end note
+
+note right of deals
+  Order = request/order lifecycle (order_ticket).
+  Deal = one historical execution (deal_ticket).
+  Position = position association (position_id).
+  One order/position can have many Deal rows.
+  order_ticket and position_id are NOT foreign keys
+  or unique identifiers of a Deal in this schema.
+  There are no ledger Order/Position tables.
+
+  Decimal values are TEXT, read back as Decimal(text).
+  Ticket/login/magic integers are TEXT, never float.
+  raw_payload = canonical JSON, including unknown fields.
+  Model raw_payload_json maps to DB raw_payload.
+  Deal id = UUID5(account UUID + ticket).
+  broker_fee comes from SDK fee; no SaaS fee.
+end note
+
+note right of deal_observations
+  Only changed-payload variants are stored here.
+  Original payload remains in deals.
+  Same identity + different payload_hash => CONFLICT.
+  Replaying a variant does not add an observation.
+  Original execution facts are not updated.
+end note
+
+legend bottom
+  * = explicit NOT NULL in SQLite DDL; PK/FK are marked separately.
+  Bare TEXT PRIMARY KEY has no explicit NOT NULL in the source's rowid tables;
+  the application supplies non-null UUIDs. Cardinalities show application usage.
+  Foreign keys are enabled per repository connection: PRAGMA foreign_keys = ON.
+  No cascade actions, additional ledger tables, or Phase 3 components are declared.
+  Source: src/aiomql/ledger/sqlite.py, models.py, normalize.py, repository.py.
+endlegend
+@enduml

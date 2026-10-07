@@ -1,0 +1,144 @@
+@startuml
+title One explicit history ingestion - current source
+hide footbox
+autonumber
+skinparam shadowing false
+actor Application as App
+participant DealIngestor as I
+participant "DealHistorySource\nMetaTraderDealHistorySource" as S
+participant MetaTrader as MT
+participant "MetaTrader5\nSDK module / terminal session" as SDK
+participant normalize_deal as N
+participant "DealRepository\nSQLiteDealRepository" as R
+database SQLite as DB
+
+note over App,DB
+  Caller supplies the source, repository and expected AccountRef.
+  Account mapping is already registered in this SQLite file.
+  Application is an external caller: current repository callers are offline tests;
+  there is no automatic invocation from the trading execution flow.
+end note
+App -> I : await ingest_range(account, from, to, ingestion_id=None)
+I -> I : Validate AccountRef, aware range -> UTC, from <= to\nGenerate ingestion_id once if omitted; validate ID
+break Invalid arguments
+  I --> App : raise TypeError / ValueError (no report)
+end
+
+I -> I : Compare source.broker_namespace with expected
+break Configured namespace mismatch before fetch
+  I --> App : FAILED / ACCOUNT_BEFORE_FETCH\nNo fetch or write
+end
+I -> S : await current_account()
+S -> MT : await account_info()
+MT -> SDK : account_info() via _handler / asyncio.to_thread
+SDK --> MT : SDK account info / None / exception
+MT --> S : result / exception
+S --> I : SessionAccount(login, server) / exception
+I -> I : Verify SessionAccount and expected login/server
+break Account mismatch or unavailable before fetch
+  I --> App : FAILED / ACCOUNT_BEFORE_FETCH\nNo fetch or write
+end
+
+I -> S : await fetch(account, UTC from, UTC to)
+S -> S : Recheck configured namespace; utc_range()
+S -> MT : await history_deals_get(date_from, date_to)
+MT -> SDK : history_deals_get(from, to) via _handler / to_thread
+SDK --> MT : raw SDK records / empty tuple / None / exception
+MT --> S : raw result / exception
+note over MT,SDK
+  For account_info and history reads, _handler can initialize/login
+  and retry when None corresponds to a connection failure (retries=3).
+  These existing read retries are not a scheduler or ingestor retry policy.
+end note
+S -> S : Validate tuple/list and record shapes\nBuild DealHistoryBatch
+S --> I : batch / exception
+break None, exception, invalid collection/record shape or non-batch result
+  I --> App : FAILED / FETCH; no Deal write
+end
+I -> I : retrieved = len(batch.deals)
+
+I -> I : Recheck source.broker_namespace
+break Namespace mismatch after fetch
+  I --> App : FAILED / ACCOUNT_AFTER_FETCH\nDiscard batch; no write
+end
+I -> S : await current_account()
+S -> MT : await account_info()
+MT -> SDK : account_info() via _handler / asyncio.to_thread
+SDK --> MT : account info / None / exception
+MT --> S : result / exception
+S --> I : SessionAccount / exception
+I -> I : Verify expected login/server again
+break Account mismatch or unavailable after fetch
+  I --> App : FAILED / ACCOUNT_AFTER_FETCH\nretrieved retained; normalized=0; no write
+end
+break Valid empty batch AFTER second guard
+  I --> App : SUCCESS_EMPTY; retrieved=0
+end
+
+I -> I : observed_at = now(UTC), once for this batch
+loop Each SDK record
+  I -> I : Extract raw mapping via _asdict() when available\nRead ticket for error attribution
+  alt Raw extraction raises
+    I -> I : invalid += 1; record NORMALIZE error\nContinue next record without calling normalizer
+  else Raw extraction succeeded
+  I -> N : normalize_deal(account, raw, observed_at, ingestion_id)
+  N -> N : Deep snapshot; canonical JSON + SHA256\nDecimal(str(number)); deterministic Deal UUID5
+  alt Normalization raises
+    N --> I : exception
+    I -> I : invalid += 1; record NORMALIZE error\nContinue next record
+  else Normalized successfully
+    N --> I : NormalizedDeal
+    I -> I : normalized += 1
+    I -> R : ingest(account, deal) [synchronous]
+    alt Repository validation / SQL / commit raises
+      opt Transaction was opened
+        R -> DB : ROLLBACK; close connection
+      end
+      R --> I : exception
+      break Abort remaining records
+        I --> App : FAILED / STORAGE\nEarlier commits and completed counters retained
+      end
+    else Repository call succeeds
+    R -> R : Verify account IDs and canonical payload/hash
+    R -> DB : Open connection; PRAGMA foreign_keys=ON\nBEGIN IMMEDIATE
+    R -> DB : Read and verify persisted account mapping
+    R -> DB : INSERT deals ...\nON CONFLICT(mt5_account_id, deal_ticket) DO NOTHING
+    alt Deal row inserted
+      R -> R : outcome = INSERTED
+    else Identity already exists
+      R -> DB : SELECT original id, payload_hash by account + ticket
+      DB --> R : original row
+      alt Same payload_hash
+        R -> R : outcome = DUPLICATE
+      else Different payload_hash
+        R -> DB : INSERT deal_observations ...\nON CONFLICT(deal_id, payload_hash) DO NOTHING
+        R -> R : outcome = CONFLICT\nobservation_added = insert rowcount > 0
+      end
+    end
+    R -> DB : COMMIT; close connection
+    R --> I : IngestResult only after successful commit
+    break Invalid repository outcome during counter lookup
+      I --> App : FAILED / STORAGE\nDo not claim successful counter increment
+    end
+    I -> I : Increment inserted / duplicates / conflicts
+    end
+  end
+  end
+end
+
+alt No errors
+  I --> App : SUCCESS (may include preserved conflicts)
+else Normalization errors and normalized > 0
+  I --> App : PARTIAL
+else All fetched records invalid
+  I --> App : FAILED
+end
+
+note over App,DB
+  IngestionReport includes ID/account/range/counters and errors with stage/index/ticket.
+  Cancellation propagates; there is no whole-batch transaction or automatic resend.
+  Configured namespace is not broker-verified; double guard cannot detect A -> B -> A.
+  Trading execution (Order -> order_send -> OrderSendResult) is a separate flow.
+  DONE_PARTIAL and OrderSendAmbiguous never trigger Deal insertion here.
+end note
+@enduml

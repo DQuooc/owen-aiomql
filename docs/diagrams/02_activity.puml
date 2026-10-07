@@ -1,0 +1,128 @@
+@startuml
+title DealIngestor.ingest_range - current implementation
+skinparam shadowing false
+skinparam activityBackgroundColor #F3F7FC
+
+start
+:Validate AccountRef type and aware datetime range;
+:Convert from/to to UTC; require from <= to;
+:Use supplied ingestion_id or generate uuid4 once;
+:Require a non-empty string ingestion_id;
+if (Arguments valid?) then (yes)
+  :Initialize counters = 0 and errors = [];
+else (no)
+  :Raise TypeError / ValueError before I/O;
+  note right: No IngestionReport for argument errors.
+  stop
+endif
+
+:stage = ACCOUNT_BEFORE_FETCH;
+:Compare configured broker_namespace;
+:current_account() -> SessionAccount;
+:Compare login and server to expected AccountRef;
+if (Guard succeeded?) then (yes)
+else (mismatch / exception)
+  :Record ACCOUNT_BEFORE_FETCH error;
+  :Return FAILED; no history fetch or Deal write;
+  stop
+endif
+
+:stage = FETCH;
+:source.fetch(account, UTC from, UTC to);
+note right
+  Concrete adapter: MetaTraderDealHistorySource.
+  Calls MetaTrader.history_deals_get -> raw SDK result.
+  Tuple/list becomes DealHistoryBatch(tuple(result)).
+  MetaTrader._handler may retry connection failures
+  for this read; the ingestor has no retry loop.
+end note
+if (Valid DealHistoryBatch returned?) then (yes)
+  :retrieved = len(batch.deals);
+else (None / exception / invalid response)
+  :Record FETCH error;
+  :Return FAILED; no Deal write;
+  stop
+endif
+
+:stage = ACCOUNT_AFTER_FETCH;
+:Repeat namespace + current_account login/server guard;
+if (Guard succeeded?) then (yes)
+else (mismatch / exception)
+  :Record ACCOUNT_AFTER_FETCH error;
+  :Return FAILED; reject entire batch before persistence;
+  stop
+endif
+
+if (retrieved == 0?) then (yes)
+  :Return SUCCESS_EMPTY;
+  note right: The second guard runs even for empty history.
+  stop
+else (no)
+  :observed_at = datetime.now(UTC), once per batch;
+endif
+
+while (Another raw record?) is (yes)
+  :Get mapping using _asdict() if available;
+  :Read ticket for error attribution when possible;
+  :normalize_deal(account, raw, observed_at, ingestion_id);
+  note right
+    Normalizer owns the deep raw snapshot,
+    canonical JSON, hash and field conversion.
+    Unknown fields are preserved.
+  end note
+  if (Extraction / normalization succeeded?) then (yes)
+    :normalized += 1;
+    :repository.ingest(account, NormalizedDeal);
+    note right
+      SQLite repository uses one transaction per call.
+      UNIQUE constraints arbitrate duplicate identities.
+      Account registration/identity is checked before insert.
+    end note
+    if (Repository call and outcome lookup succeeded?) then (yes)
+      switch (IngestResult.outcome)
+      case (INSERTED)
+        :inserted += 1;
+      case (DUPLICATE)
+        :duplicates += 1;
+      case (CONFLICT)
+        :conflicts += 1;
+        note right
+          Changed raw payload is an idempotent observation.
+          Original Deal is unchanged; conflict is not an error.
+        end note
+      endswitch
+    else (exception)
+      :Record STORAGE error with index/ticket;
+      :Return FAILED; stop processing remaining records;
+      note right
+        Earlier committed rows and counters remain.
+        No whole-batch rollback or automatic retry.
+      end note
+      stop
+    endif
+  else (exception)
+    :invalid += 1;
+    :Record NORMALIZE error with index/ticket when readable;
+    :Continue with next record;
+  endif
+endwhile (no)
+
+if (errors is non-empty?) then (yes)
+  if (normalized > 0?) then (yes)
+    :Return PARTIAL;
+  else (no)
+    :Return FAILED (all records invalid);
+  endif
+else (no)
+  :Return SUCCESS;
+endif
+stop
+
+legend bottom
+  Every report contains ingestion_id, mt5_account_id, requested_from/to (UTC),
+  status, retrieved, normalized, inserted, duplicates, conflicts, invalid, errors.
+  Cancellation propagates; it is not converted to FAILED or SUCCESS_EMPTY.
+  No boundary filtering, scheduler, watermark, recovery or reconciliation exists here.
+  Source: src/aiomql/ledger/ingestion.py, source.py, normalize.py, sqlite.py.
+endlegend
+@enduml

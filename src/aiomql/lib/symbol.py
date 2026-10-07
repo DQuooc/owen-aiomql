@@ -1,0 +1,227 @@
+"""Truy xuất và xử lý thông tin của công cụ tài chính."""
+
+from datetime import datetime
+from logging import getLogger
+
+from ..core.constants import TimeFrame, CopyTicks
+from ..core.base import _Base
+from ..core.models import SymbolInfo, BookInfo
+from ..core.volume import round_volume
+from .ticks import Tick
+from .account import Account
+from .candle import Candles
+from .ticks import Ticks
+
+logger = getLogger(__name__)
+
+
+class Symbol(_Base, SymbolInfo):
+    """Quản lý thông tin và dữ liệu giá của một công cụ tài chính."""
+    initialized: bool
+    tick: Tick
+    account: Account
+
+    def __init__(self, **kwargs):
+        """Khởi tạo `Symbol`; phối hợp với `Account`."""
+        assert "name" in kwargs, "Symbol Object Must be initialized with a name"
+        super().__init__(**kwargs)
+        self.account = Account()
+        self.initialized = False
+
+    async def info_tick(self, *, name: str = "") -> Tick | None:
+        """Lấy giá tick mới nhất của mã giao dịch; gọi `MetaTrader.symbol_info_tick`, `MetaTrader.symbol_select`."""
+        try:
+            if not name:
+                tick = await self.mt5.symbol_info_tick(self.name)
+            else:
+                await self.mt5.symbol_select(name, True)
+                await self.mt5.market_book_add(name)
+                tick = await self.mt5.symbol_info_tick(name)
+            if tick is not None:
+                tick = Tick(**tick._asdict())
+                setattr(self, "tick", tick) if not name else ...
+            return tick
+        except Exception as err:
+            logger.warning("%s: Unable to get tick for %s", err, self.name)
+            return None
+
+    async def symbol_select(self, *, enable: bool = True) -> bool:
+        """Bật hoặc tắt mã giao dịch trong bảng Theo dõi thị trường; gọi `MetaTrader.symbol_select`."""
+        self.select = await self.mt5.symbol_select(self.name, enable)
+        return self.select
+
+    async def info(self) -> SymbolInfo | None:
+        """Lấy thông tin hiện tại của đối tượng; gọi `MetaTrader.symbol_info`."""
+        info = await self.mt5.symbol_info(self.name)
+        if info is not None:
+            info = info._asdict()
+            self.set_attributes(**info)
+            return SymbolInfo(**info)
+        return None
+
+    async def initialize(self) -> bool:
+        """Khởi tạo dữ liệu và tài nguyên của `Symbol`; gọi `MetaTrader.symbol_select`, `MetaTrader.market_book_add`."""
+        try:
+            select = await self.mt5.symbol_select(self.name, True)
+            self.select = select
+
+            await self.mt5.market_book_add(self.name)
+
+            info = await self.mt5.symbol_info(self.name)
+            if info is not None:
+                self.set_attributes(**info._asdict())
+
+            info_tick = await self.mt5.symbol_info_tick(self.name)
+
+            if info_tick:
+                self.tick = Tick(**info_tick._asdict())
+
+            if info is not None and info_tick is not None:
+                self.initialized = True
+                return True
+
+            logger.warning("Unable to initialize %s", self.name)
+            return False
+        except Exception as err:
+            logger.warning("%s: Unable to initialize %s", err, self.name)
+            return False
+
+    def initialize_sync(self) -> bool:
+        """Khởi tạo `Symbol` theo luồng đồng bộ; gọi `MetaTrader._symbol_select`, `MetaTrader._market_book_add`."""
+        try:
+            select = self.mt5._symbol_select(self.name, True)
+            self.select = select
+
+            self.mt5._market_book_add(self.name)
+
+            info = self.mt5._symbol_info(self.name)
+            if info is not None:
+                self.set_attributes(**info._asdict())
+
+            info_tick = self.mt5._symbol_info_tick(self.name)
+            if info_tick:
+                self.tick = Tick(**info_tick._asdict())
+
+            if info is not None and info_tick is not None:
+                self.initialized = True
+                return True
+            logger.warning("Unable to initialize %s", self.name)
+            return False
+        except Exception as err:
+            logger.warning("%s: Unable to initialize %s", err, self.name)
+            return False
+
+    async def book_add(self) -> bool:
+        """Đăng ký nhận dữ liệu sổ lệnh của mã giao dịch; gọi `MetaTrader.market_book_add`."""
+        res = await self.mt5.market_book_add(self.name)
+        if not res:
+            logger.debug("Could not add %s to market book", self.name)
+        return res
+
+    async def book_get(self) -> tuple[BookInfo, ...]:
+        """Lấy dữ liệu sổ lệnh của mã giao dịch; gọi `MetaTrader.market_book_get`."""
+        book_info = await self.mt5.market_book_get(self.name)
+
+        if book_info is not None:
+            book_infos = (BookInfo(**info._asdict()) for info in book_info)
+            return tuple(book_infos)
+
+        raise ValueError(f"Could not get book info for {self.name}")
+
+    async def book_release(self) -> bool:
+        """Hủy đăng ký dữ liệu sổ lệnh của mã giao dịch; gọi `MetaTrader.market_book_release`."""
+        return await self.mt5.market_book_release(self.name)
+
+    def check_volume(self, *, volume: float) -> tuple[bool, float]:
+        """Kiểm tra khối lượng giao dịch; dùng dữ liệu nội bộ của lớp và các đối tượng miền giao dịch."""
+        if check := self.volume_min <= volume <= self.volume_max:
+            return check, volume
+        else:
+            return check, self.volume_min if volume <= self.volume_min else self.volume_max
+
+    def round_off_volume(self, *, volume: float, round_down: bool = False) -> float:
+        """Làm tròn khối lượng theo bước giao dịch của nhà môi giới; dùng dữ liệu nội bộ của lớp và các đối tượng miền giao dịch."""
+        return round_volume(volume=volume, minimum=self.volume_min, step=self.volume_step, round_down=round_down)
+
+    async def amount_in_quote_currency(self, *, amount: float) -> float:
+        """Quy đổi số tiền sang đồng tiền định giá; dùng dữ liệu nội bộ của lớp và các đối tượng miền giao dịch."""
+        if self.currency_profit != self.account.currency:
+            amount = await self.convert_currency(
+                amount=amount, from_currency=self.account.currency, to_currency=self.currency_profit
+            )
+        return amount
+
+    async def compute_volume(self, *args, **kwargs) -> float:
+        """Tính khối lượng giao dịch; dùng dữ liệu nội bộ của lớp và các đối tượng miền giao dịch."""
+        return self.volume_min
+
+    async def convert_currency(self, *, amount: float, from_currency: str, to_currency: str) -> float | None:
+        """Chuyển đổi tiền tệ; dùng dữ liệu nội bộ của lớp và các đối tượng miền giao dịch."""
+        base, quote = to_currency, from_currency
+        try:
+            pair = f"{quote}{base}"
+            tick = await self.info_tick(name=pair)
+            if tick is not None:
+                return round(amount * tick.bid, 2)
+
+            pair = f"{base}{quote}"
+            tick = await self.info_tick(name=pair)
+            return round(amount / tick.ask, 2)
+        except Exception as err:
+            logger.warning(f"{err}: Currency conversion failed: Unable to convert {amount} in {quote} to {base}")
+            return None
+
+    async def copy_rates_from(self, *, timeframe: TimeFrame, date_from: datetime | int, count: int = 500) -> Candles:
+        """Lấy dữ liệu nến từ một thời điểm; gọi `MetaTrader.copy_rates_from`."""
+        rates = await self.mt5.copy_rates_from(self.name, timeframe, date_from, count)
+        if rates is not None:
+            return Candles(data=rates)
+        raise ValueError(f"Could not get rates for {self.name}.")
+
+    async def copy_rates_from_pos(self, *, timeframe: TimeFrame, count: int = 500, start_position: int = 0) -> Candles:
+        """Lấy dữ liệu nến từ vị trí chỉ định; gọi `MetaTrader.copy_rates_from_pos`."""
+        rates = await self.mt5.copy_rates_from_pos(self.name, timeframe, start_position, count)
+        if rates is not None:
+            return Candles(data=rates)
+        raise ValueError(f"Could not get rates for {self.name}.")
+
+    async def copy_rates_range(
+        self, *, timeframe: TimeFrame, date_from: datetime | int, date_to: datetime | int
+    ) -> Candles:
+        """Lấy dữ liệu nến trong một khoảng thời gian; gọi `MetaTrader.copy_rates_range`."""
+        rates = await self.mt5.copy_rates_range(
+            symbol=self.name, timeframe=timeframe, date_from=date_from, date_to=date_to
+        )
+        if rates is not None:
+            return Candles(data=rates)
+        raise ValueError(f"Could not get rates for {self.name}.")
+
+    async def copy_ticks_from(self, *, date_from: datetime | int, count: int = 100,
+                              flags: CopyTicks = CopyTicks.ALL) -> Ticks:
+        """Lấy dữ liệu tick từ một thời điểm; gọi `MetaTrader.copy_ticks_from`."""
+        ticks = await self.mt5.copy_ticks_from(self.name, date_from, count, flags)
+        if ticks is not None:
+            return Ticks(data=ticks)
+        raise ValueError(f"Could not get ticks for {self.name}.")
+
+    async def copy_ticks_range(
+        self, *, date_from: datetime | int, date_to: datetime | int, flags: CopyTicks = CopyTicks.ALL
+    ) -> Ticks:
+        """Lấy dữ liệu tick trong một khoảng thời gian; gọi `MetaTrader.copy_ticks_range`."""
+        ticks = await self.mt5.copy_ticks_range(self.name, date_from, date_to, flags)
+        if ticks is not None:
+            return Ticks(data=ticks)
+        raise ValueError(f"Could not get ticks for {self.name}.")
+
+    async def compute_volume_sl(self, *, amount: float, price: float, sl: float, round_down: bool = False) -> float:
+        """Tính khối lượng giao dịch mức dừng lỗ; dùng dữ liệu nội bộ của lớp và các đối tượng miền giao dịch."""
+        raise NotImplementedError
+
+    async def compute_volume_points(self, *, amount: float, points: float, round_down: bool = False) -> float:
+        """Tính khối lượng giao dịch số điểm giá; dùng dữ liệu nội bộ của lớp và các đối tượng miền giao dịch."""
+        raise NotImplementedError
+
+    @property
+    def pip(self) -> float:
+        """Tính kích thước một pip của mã giao dịch; dùng dữ liệu nội bộ của lớp và các đối tượng miền giao dịch."""
+        return self.point * 10

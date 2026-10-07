@@ -1,0 +1,21 @@
+# simple_trader
+
+`aiomql.contrib.traders.simple_trader` — Simple trader (with stop loss).
+
+## Overview
+
+The `SimpleTrader` places trades with a stop loss and calculates volume based on
+risk assessment via the [`RAM`](../../lib/ram.md) instance.
+
+## Classes
+
+### `SimpleTrader`
+
+> Places risk-managed trades with a stop loss.
+
+Inherits from [`Trader`](../../lib/trader.md).
+
+#### `place_trade(*, order_type, sl, parameters=None)`
+
+Places a market order with the given `order_type` and `sl` (stop loss). The volume
+is calculated using the `RAM` instance based on the stop-loss distance.

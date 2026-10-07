@@ -1,0 +1,22 @@
+# scalp_trader
+
+`aiomql.contrib.traders.scalp_trader` — Scalp trader (no stop levels).
+
+## Overview
+
+The `ScalpTrader` places trades without stop loss or take profit levels, using the
+minimum lot size. Suitable for quick scalping strategies where risk is managed
+externally (e.g. via a `PositionTracker`).
+
+## Classes
+
+### `ScalpTrader`
+
+> Places trades without stop levels.
+
+Inherits from [`Trader`](../../lib/trader.md).
+
+#### `place_trade(*, order_type, volume=None, parameters=None)`
+
+Places a market order using `order_type`. If `volume` is not provided, the symbol's
+minimum volume is used. The trade is recorded in the trade record file.
