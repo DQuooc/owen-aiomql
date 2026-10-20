@@ -1,9 +1,9 @@
 """Local SQLite implementation of the account-scoped Deal Ledger."""
 
 from contextlib import contextmanager, closing
+from dataclasses import fields
 from datetime import datetime, timezone
 from decimal import Decimal
-import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -11,6 +11,7 @@ from typing import Iterator
 from uuid import UUID, uuid5
 
 from .models import AccountRef, NormalizedDeal
+from .normalize import NORMALIZER_VERSION, normalize_deal
 from .repository import AccountIdentityError, DealObservation, IngestOutcome, IngestResult
 
 
@@ -190,24 +191,42 @@ class SQLiteDealRepository:
         )
 
     @staticmethod
-    def _validate_payload(deal: NormalizedDeal) -> None:
+    def _validate_deal(account: AccountRef, deal: NormalizedDeal) -> None:
+        """Reject inconsistent models before any write or replay classification.
+
+        Version 1's JSON snapshot contains the SDK primitives needed to run the
+        authoritative normalizer again. Ingestion metadata is validated as input,
+        not compared with the first observation already stored in the database.
+        """
+        if type(deal.normalizer_version) is not int or deal.normalizer_version != NORMALIZER_VERSION:
+            raise ValueError("unsupported deal normalizer_version")
+        if not isinstance(deal.raw_payload_json, str):
+            raise ValueError("deal raw_payload_json must be a canonical JSON object")
         try:
             raw = json.loads(deal.raw_payload_json)
-            canonical = json.dumps(raw, sort_keys=True, separators=(",", ":"),
-                                   ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("deal raw_payload_json must be valid canonical JSON") from exc
-        if not isinstance(raw, dict) or canonical != deal.raw_payload_json:
-            raise ValueError("deal raw_payload_json must be a canonical JSON object")
-        if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != deal.payload_hash:
-            raise ValueError("deal payload_hash does not match raw_payload_json")
+        expected = normalize_deal(account, raw, deal.first_seen_at, deal.ingestion_id)
+        for field in fields(NormalizedDeal):
+            if field.name in ("first_seen_at", "ingestion_id"):
+                # normalize_deal validates these; aware offsets and new run IDs
+                # are legitimate, independent of broker payload and Deal identity.
+                continue
+            actual, derived = getattr(deal, field.name), getattr(expected, field.name)
+            # Equality alone accepts False == 0 and float/int == Decimal values.
+            if type(actual) is not type(derived):
+                raise ValueError(f"deal {field.name} has an invalid normalized type")
+            if isinstance(actual, Decimal) and not actual.is_finite():
+                raise ValueError(f"deal {field.name} must be finite")
+            if actual != derived:
+                raise ValueError(f"deal {field.name} is inconsistent with its account/raw payload")
 
     def ingest(self, account: AccountRef, deal: NormalizedDeal) -> IngestResult:
         if not isinstance(account, AccountRef) or not isinstance(deal, NormalizedDeal):
             raise TypeError("ingest requires AccountRef and NormalizedDeal")
         if deal.mt5_account_id != account.mt5_account_id:
             raise AccountIdentityError("deal account ID differs from supplied account context")
-        self._validate_payload(deal)
+        self._validate_deal(account, deal)
         account_id = str(account.mt5_account_id)
         with self._write() as conn:
             registered = conn.execute(

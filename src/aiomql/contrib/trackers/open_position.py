@@ -7,7 +7,7 @@ import asyncio
 from ...lib import Symbol, Positions, Order
 from ...core.models import TradePosition, TradeAction, OrderSendResult
 from ...core.constants import OrderType, TradeRetcode
-from ...core.exceptions import OrderSendAmbiguous
+from ...core.exceptions import OrderError, OrderSendAmbiguous
 from ...core.config import Config
 from ...utils.price_utils import increase_value_by_pct, decrease_value_by_pct
 from .position_trackers import PositionTracker
@@ -22,6 +22,19 @@ class PendingOrder:
     is_hedge: bool = False
     is_stack: bool = False
     open_pos_params: dict = field(default_factory=dict)
+
+
+@dataclass
+class ExposureAttempt:
+    """In-memory evidence for a submission that must not be automatically repeated.
+
+    A missing result/volume is unknown, never zero execution. There is no durable
+    journal or reconciliation/reset API here; unresolved attempts require explicit
+    broker reconciliation before a caller can safely authorize another operation.
+    """
+    request: dict
+    result: OrderSendResult | None = None
+    error: BaseException | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -46,6 +59,8 @@ class OpenPosition:
     close_hedges_on_close: bool = False
     close_stacks_on_close: bool = False
     _trackers: dict[str, PositionTracker] = field(default_factory=dict)
+    unresolved_hedge: ExposureAttempt | None = field(default=None, init=False)
+    unresolved_stack: ExposureAttempt | None = field(default=None, init=False)
     positions: ClassVar[Positions]
     state_key: ClassVar[str] = "tracked_positions"
     archive_key: ClassVar[str] = "archived_positions"
@@ -327,11 +342,47 @@ class OpenPosition:
         rate = increase_value_by_pct(price_open, rate) if self.position.type.is_long else decrease_value_by_pct(price_open, rate)
         return rate
 
+    async def _send_exposure_order(self, *, kind: str, order: Order) -> OrderSendResult:
+        """Latch before awaiting send, including its checks, and retain all evidence.
+
+        Market and pending helpers share a guard for each kind of exposure. The
+        check/set has no await, so concurrent tasks on this object's event loop
+        cannot resubmit while unresolved. This is not a cross-thread/process or restart guard.
+        Only confirmed zero-volume REJECT or completed bookkeeping clears it.
+        Other errors (including preflight errors) conservatively remain latched.
+        """
+        attribute = f"unresolved_{kind}"
+        previous = getattr(self, attribute)
+        if previous is not None:
+            if isinstance(previous.error, OrderSendAmbiguous):
+                raise previous.error
+            raise OrderError(f"Unresolved {kind} submission for {self.ticket}; explicit reconciliation required")
+        attempt = ExposureAttempt(request=dict(order.request))
+        setattr(self, attribute, attempt)
+        try:
+            result = await order.send()
+            attempt.result = result
+            retcode = getattr(result, "retcode", None)
+            if (isinstance(retcode, bool) or not isinstance(retcode, int)
+                    or retcode in (TradeRetcode.TIMEOUT, TradeRetcode.CONNECTION)):
+                raise OrderSendAmbiguous(request=attempt.request, result=result)
+            volume = getattr(result, "volume", None)
+            if (result.retcode == TradeRetcode.REJECT and isinstance(volume, (int, float))
+                    and not isinstance(volume, bool) and volume == 0):
+                setattr(self, attribute, None)
+            return result
+        except BaseException as exc:
+            attempt.error = exc
+            if isinstance(exc, OrderSendAmbiguous):
+                attempt.request = dict(exc.request)
+                attempt.result = exc.result
+            raise
+
     async def hedge_order(self, *, price: float, order_params: dict = None,
                           open_pos_params: dict = None) -> tuple[bool, OrderSendResult | None]:
         """Tạo lệnh chờ phòng hộ cho vị thế; phối hợp với `Order`."""
         try:
-            order_params = order_params or {}
+            order_params = dict(order_params or {})
             open_pos_params = open_pos_params or {}
             order_type = order_params.pop("type", OrderType.SELL_STOP if self.position.type.is_long else OrderType.BUY_STOP)
             volume = order_params.pop("volume", self.position.volume)
@@ -339,7 +390,7 @@ class OpenPosition:
             symbol = order_params.pop("symbol", self.symbol.name)
             comment = order_params.pop("comment", f"Hedge_{self.symbol.name}:{self.ticket}")
             order = Order(action=action, symbol=symbol, type=order_type, price=price, volume=volume, comment=comment, **order_params)
-            res = await order.send()
+            res = await self._send_exposure_order(kind="hedge", order=order)
             if res.retcode == TradeRetcode.DONE_PARTIAL:
                 logger.warning("Hedge order for position %s partially placed: %s of %s", self.ticket, res.volume, volume)
                 return False, res
@@ -350,6 +401,7 @@ class OpenPosition:
             pending_order = PendingOrder(order=res, is_hedge=True, open_pos_params=open_pos_params)
             self.pending_orders[res.order] = pending_order
             self.is_hedged = True
+            self.unresolved_hedge = None
             return True, res
         except OrderSendAmbiguous:
             raise
@@ -361,7 +413,7 @@ class OpenPosition:
                           open_pos_params: dict = None) -> tuple[bool, OrderSendResult | None]:
         """Tạo lệnh chờ bổ sung vị thế cùng chiều; phối hợp với `Order`."""
         try:
-            order_params = order_params or {}
+            order_params = dict(order_params or {})
             open_pos_params = open_pos_params or {}
             order_type = order_params.pop("type", OrderType.BUY_STOP if self.position.type.is_long else OrderType.SELL_STOP)
             volume = order_params.pop("volume", self.position.volume)
@@ -369,7 +421,7 @@ class OpenPosition:
             symbol = order_params.pop("symbol", self.symbol.name)
             comment = order_params.pop("comment", f"Stack_{self.symbol.name}:{self.ticket}")
             order = Order(action=action, symbol=symbol, type=order_type, price=price, volume=volume, comment=comment, **order_params)
-            res = await order.send()
+            res = await self._send_exposure_order(kind="stack", order=order)
             if res.retcode == TradeRetcode.DONE_PARTIAL:
                 logger.warning("Stack order for position %s partially placed: %s of %s", self.ticket, res.volume, volume)
                 return False, res
@@ -380,6 +432,7 @@ class OpenPosition:
             pending_order = PendingOrder(order=res, is_stack=True, open_pos_params=open_pos_params)
             self.pending_orders[res.order] = pending_order
             self.is_stacked = True
+            self.unresolved_stack = None
             return True, res
         except OrderSendAmbiguous:
             raise
@@ -395,7 +448,7 @@ class OpenPosition:
                              open_pos_params: dict = None) -> tuple[bool, OrderSendResult | None]:
         """Mở vị thế ngược chiều để phòng hộ vị thế hiện tại; phối hợp với `Symbol.info_tick` và `Order`."""
         try:
-            order_params = order_params or {}
+            order_params = dict(order_params or {})
             open_pos_params = open_pos_params or {}
             volume = order_params.pop("volume", self.position.volume)
             order_type = order_params.pop("type", OrderType(self.position.type).opposite)
@@ -405,7 +458,7 @@ class OpenPosition:
                 price = (tick.ask if order_type.is_long else tick.bid)
             comment = order_params.pop("comment", f"Hedge:{self.symbol.name}:{self.ticket}")
             hedge_order = Order(type=order_type, symbol=symbol, volume=volume, price=price, comment=comment, **order_params)
-            res = await hedge_order.send()
+            res = await self._send_exposure_order(kind="hedge", order=hedge_order)
             if res.retcode == TradeRetcode.DONE_PARTIAL:
                 logger.warning("Hedge for position %s partially filled: %s of %s", self.ticket, res.volume, volume)
                 return False, res
@@ -421,6 +474,7 @@ class OpenPosition:
             hedge = OpenPosition(symbol=symbol, ticket=res.order, position=hedge_pos, hedge=self, is_a_hedge=True, **open_pos_params)
             self.hedges[res.order] = hedge
             self.is_hedged = True
+            self.unresolved_hedge = None
             return True, res
         except OrderSendAmbiguous:
             raise
@@ -433,7 +487,7 @@ class OpenPosition:
                              open_pos_params: dict = None) -> tuple[bool, OrderSendResult | None]:
         """Mở thêm vị thế cùng chiều với vị thế hiện tại; phối hợp với `Symbol.info_tick` và `Order`."""
         try:
-            order_params = order_params or {}
+            order_params = dict(order_params or {})
             open_pos_params = open_pos_params or {}
             volume = order_params.pop("volume", self.position.volume)
             order_type = order_params.pop("type", self.position.type)
@@ -443,7 +497,7 @@ class OpenPosition:
                 price = (tick.ask if order_type == OrderType.BUY else tick.bid)
             comment = order_params.pop("comment", f"Stack:{self.symbol.name}:{self.ticket}")
             stack_order = Order(type=order_type, symbol=symbol, volume=volume, price=price, comment=comment, **order_params)
-            res = await stack_order.send()
+            res = await self._send_exposure_order(kind="stack", order=stack_order)
             if res.retcode == TradeRetcode.DONE_PARTIAL:
                 logger.warning("Stack for position %s partially filled: %s of %s", self.ticket, res.volume, volume)
                 return False, res
@@ -459,6 +513,7 @@ class OpenPosition:
             stack = OpenPosition(symbol=symbol, ticket=res.order, position=stack_pos, stack=self, is_a_stack=True, **open_pos_params)
             self.is_stacked = True
             self.stacks[res.order] = stack
+            self.unresolved_stack = None
             return True, res
         except OrderSendAmbiguous:
             raise

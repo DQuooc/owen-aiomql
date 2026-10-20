@@ -21,7 +21,7 @@ from ..constants import OrderType, CopyTicks, TradeAction, TradeRetcode
 
 from .._core import MetaCore
 from ..errors import Error
-from ..exceptions import OrderSendAmbiguous
+from ..exceptions import OrderError, OrderSendAmbiguous
 from ..exceptions import InvalidVolume
 from ..volume import numeric_volume, validate_volume
 from ..config import Config
@@ -285,7 +285,11 @@ class MetaTrader(MetaCore):
         return self._handler(api)
 
     def order_send(self, request: dict) -> OrderSendResult:
-        """Send once; raise OrderSendAmbiguous when execution cannot be confirmed."""
+        """Check the final normalized snapshot, then send once.
+
+        Earlier caller checks do not authorize this send. Check failures occur
+        before submission; only unconfirmed sends raise OrderSendAmbiguous.
+        """
         request = dict(request)
         if request.get("action") in (TradeAction.DEAL, TradeAction.PENDING) or "volume" in request:
             volume = numeric_volume(request.get("volume"))
@@ -301,6 +305,16 @@ class MetaTrader(MetaCore):
         if comment is not None and len(comment) > 25:
             request["comment"] = comment[:25]
             logger.warning("order comment length exceeds 25 characters.")
+        checked_request = dict(request)
+        check = self._handler(
+            {"func": self._order_check, "args": (checked_request,), "error_msg": "Error in checking order."},
+            retry_safe=False,
+        )
+        retcode = getattr(check, "retcode", None)
+        if isinstance(retcode, bool) or not isinstance(retcode, int) or retcode != 0:
+            raise OrderError(f"Order check failed or rejected for {request.get('symbol', '')}")
+        if checked_request != request:
+            raise OrderError("Order request changed during check; refusing to send")
         api = {"func": self._order_send, "args": (request,), "error_msg": "Error in sending order."}
         try:
             res = self._handler(api, retry_safe=False)

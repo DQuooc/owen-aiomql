@@ -5,11 +5,14 @@ from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
 from threading import Barrier
 import unittest
+from unittest.mock import patch
 from uuid import UUID
 
 from test_deal_normalizer import ledger, raw_deal
@@ -45,6 +48,20 @@ class DealRepositoryTests(unittest.TestCase):
     def count(self, table):
         with closing(sqlite3.connect(self.path)) as conn, conn:
             return conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+
+    def assert_invalid_deal(self, deal):
+        """Invalid models must not reach a transaction or change any ledger table."""
+        def snapshot():
+            with closing(sqlite3.connect(self.path)) as conn:
+                return tuple(conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+                             for table in ("ledger_accounts", "deals", "deal_observations"))
+
+        before = snapshot()
+        with patch.object(self.repo, "_write", side_effect=AssertionError("invalid input reached write")) as write:
+            with self.assertRaises(ValueError):
+                self.repo.ingest(self.account, deal)
+            write.assert_not_called()
+        self.assertEqual(snapshot(), before)
 
     def test_register_resolve_and_reopen_preserve_uuid_and_deal(self):
         self.register()
@@ -243,6 +260,165 @@ class DealRepositoryTests(unittest.TestCase):
                                    "company_observed", "trade_mode"})
         self.assertIn("broker_fee", deal_columns)
         self.assertNotIn("saas_fee", deal_columns)
+
+    def test_nonfinite_decimals_cannot_enter_any_decimal_column(self):
+        self.register()
+        deal = self.deal()
+        for name in ("volume", "price", "commission", "swap", "profit", "broker_fee", "sl", "tp"):
+            for value in ("NaN", "sNaN", "Infinity", "-Infinity"):
+                with self.subTest(field=name, value=value):
+                    self.assert_invalid_deal(replace(deal, **{name: Decimal(value)}))
+
+    def test_negative_and_payload_inconsistent_volume_and_price_are_rejected(self):
+        self.register()
+        deal = self.deal()
+        for changes in ({"volume": Decimal("-1")}, {"volume": Decimal("99")},
+                        {"price": Decimal("99")}, {"volume": Decimal(0.15)}):
+            with self.subTest(changes=changes):
+                self.assert_invalid_deal(replace(deal, **changes))
+        # Rejected input has not poisoned a later, valid first insert.
+        self.assertEqual(self.repo.ingest(self.account, deal).outcome, ledger.IngestOutcome.INSERTED)
+        self.assertEqual(self.repo.get(self.account.mt5_account_id, deal.deal_ticket), deal)
+
+    def test_all_payload_derived_fields_must_match_the_raw_snapshot(self):
+        self.register()
+        deal = self.deal()
+        changes = dict(order_ticket=8888, position_id=7777, symbol="GBPUSD", deal_type=999,
+                       deal_entry=999, magic=43, commission=Decimal("-99"), swap=Decimal("-1"),
+                       profit=Decimal("99"), broker_fee=Decimal("-1"), broker_time_seconds=1,
+                       executed_at_msc=1, reason=None, sl=None, tp=Decimal("9"),
+                       comment="not the broker comment", external_id="not the broker ID")
+        for name, value in changes.items():
+            with self.subTest(field=name):
+                self.assert_invalid_deal(replace(deal, **{name: value}))
+
+    def test_equal_values_of_incorrect_types_do_not_pass_validation(self):
+        self.register()
+        deal = self.deal(volume=1.0, price=1.0, commission=0, swap=0, profit=0, fee=0,
+                         sl=1.0, tp=1.0, type=0, entry=0, reason=0)
+        for name in ("volume", "price", "commission", "swap", "profit", "broker_fee", "sl", "tp"):
+            for value in (int(getattr(deal, name)), float(getattr(deal, name)),
+                          str(getattr(deal, name)), None, False):
+                with self.subTest(field=name, value=value):
+                    self.assert_invalid_deal(replace(deal, **{name: value}))
+        for name in ("deal_ticket", "order_ticket", "position_id", "deal_type", "deal_entry",
+                     "magic", "broker_time_seconds", "executed_at_msc", "reason"):
+            with self.subTest(field=name):
+                self.assert_invalid_deal(replace(deal, **{name: float(getattr(deal, name))}))
+        for name in ("deal_type", "deal_entry", "reason"):
+            with self.subTest(field=name, value=False):
+                self.assert_invalid_deal(replace(deal, **{name: False}))
+
+    def test_ticket_and_deterministic_uuid_cannot_be_forged(self):
+        self.register()
+        deal = self.deal()
+        wrong_id = self.deal(ticket=9002).id
+        for changes in ({"deal_ticket": 9002}, {"id": wrong_id},
+                        {"id": wrong_id, "deal_ticket": 9002}, {"id": UUID(int=0)},
+                        {"id": str(deal.id)}, {"deal_ticket": 0}, {"deal_ticket": -1}):
+            with self.subTest(changes=changes):
+                self.assert_invalid_deal(replace(deal, **changes))
+
+    def test_incorrect_account_uuid_and_cross_account_derived_id_are_rejected(self):
+        self.register()
+        self.repo.register_account(self.other)
+        deal = self.deal()
+        for value in (self.other.mt5_account_id, UUID(int=0), str(self.account.mt5_account_id), None):
+            with self.subTest(account=value):
+                self.assert_invalid_deal(replace(deal, mt5_account_id=value))
+        # Relabeling the other account's normalized Deal still leaves its UUID inconsistent.
+        self.assert_invalid_deal(replace(self.deal(self.other), mt5_account_id=self.account.mt5_account_id))
+
+    def test_invalid_hash_and_unsupported_normalizer_version_are_rejected(self):
+        self.register()
+        deal = self.deal()
+        for value in ("0" * 64, "", None, deal.payload_hash.encode()):
+            with self.subTest(hash=value):
+                self.assert_invalid_deal(replace(deal, payload_hash=value))
+        for version in (0, -1, ledger.NORMALIZER_VERSION + 1, True, 1.0, "1", None):
+            with self.subTest(version=version):
+                self.assert_invalid_deal(replace(deal, normalizer_version=version))
+
+    def test_malformed_or_noncanonical_raw_cannot_be_rescued_by_a_matching_hash(self):
+        self.register()
+        deal = self.deal()
+        raw_cases = [None, b"{}", {}, "{", "[]", "null", "42", '"text"', "{}",
+                     json.dumps(deal.raw_payload), deal.raw_payload_json + " ",
+                     deal.raw_payload_json[:-1] + ',"ticket":9001}']
+        for changes in ({"volume": -1}, {"volume": "0.15"}, {"ticket": True},
+                        {"time_msc": -1}, {"extra": float("nan")}, {"price": float("inf")},
+                        {"extra": -float("inf")}):
+            raw_cases.append(json.dumps(raw_deal(**changes), sort_keys=True, separators=(",", ":")))
+        for raw in raw_cases:
+            with self.subTest(raw=raw):
+                hash_ = hashlib.sha256(raw.encode()).hexdigest() if isinstance(raw, str) else deal.payload_hash
+                self.assert_invalid_deal(replace(deal, raw_payload_json=raw, payload_hash=hash_))
+
+    def test_invalid_metadata_is_rejected_before_any_write(self):
+        self.register()
+        deal = self.deal()
+        for changes in ({"first_seen_at": self.when.replace(tzinfo=None)}, {"first_seen_at": None},
+                        {"first_seen_at": self.when.isoformat()}, {"ingestion_id": ""},
+                        {"ingestion_id": " "}, {"ingestion_id": None}, {"ingestion_id": 123}):
+            with self.subTest(changes=changes):
+                self.assert_invalid_deal(replace(deal, **changes))
+
+    def test_invalid_input_cannot_be_classified_as_duplicate_or_create_false_conflict(self):
+        self.register()
+        original = self.deal()
+        self.repo.ingest(self.account, original)
+        changed = self.deal(comment="actual broker correction", profit=99.25)
+        self.assert_invalid_deal(replace(original, volume=Decimal("99")))
+        self.assert_invalid_deal(replace(original, raw_payload_json=changed.raw_payload_json,
+                                         payload_hash=changed.payload_hash))
+        self.assert_invalid_deal(replace(changed, profit=original.profit))
+        self.assertEqual(self.repo.ingest(self.account, changed).outcome, ledger.IngestOutcome.CONFLICT)
+        self.assert_invalid_deal(replace(changed, price=Decimal("99")))
+        self.assertEqual(self.repo.get(self.account.mt5_account_id, original.deal_ticket), original)
+        self.assertEqual(self.count("deal_observations"), 1)
+
+    def test_valid_zero_nullable_unknown_and_negative_historical_values_remain_supported(self):
+        self.register()
+        variants = (
+            raw_deal(ticket=9001, order=0, position_id=0, magic=0, volume=0, price=0,
+                     commission=0, swap=0, profit=0, fee=0, symbol="", comment="", external_id="",
+                     reason=None, sl=None, tp=None),
+            raw_deal(ticket=9002, volume=0.015, price=-1.25, commission=-0.2, swap=-1,
+                     profit=-12, fee=-0.03, type=999, entry=998, reason=997,
+                     extra={"unicode": "cà phê", "items": [0, "", None, {"future": True}]}),
+        )
+        for raw in variants:
+            with self.subTest(ticket=raw["ticket"]):
+                deal = ledger.normalize_deal(self.account, raw, self.when, "valid-history")
+                self.assertEqual(self.repo.ingest(self.account, deal).outcome, ledger.IngestOutcome.INSERTED)
+                loaded = self.repo.get(self.account.mt5_account_id, deal.deal_ticket)
+                self.assertEqual(loaded, deal)
+                self.assertEqual(loaded.raw_payload, raw)
+
+    def test_metadata_changes_decimal_scale_conflicts_and_reopen_remain_compatible(self):
+        self.register()
+        original = replace(self.deal(), first_seen_at=self.when, volume=Decimal("0.1500"))
+        self.assertEqual(self.repo.ingest(self.account, original).outcome, ledger.IngestOutcome.INSERTED)
+        replay = replace(original, first_seen_at=self.when + timedelta(days=1), ingestion_id="new-run")
+        self.assertEqual(self.repo.ingest(self.account, replay).outcome, ledger.IngestOutcome.DUPLICATE)
+        changed = replace(self.deal(profit=99.25, extra={"future": [1, None]}),
+                          first_seen_at=self.when + timedelta(days=2), ingestion_id="correction")
+        first = self.repo.ingest(self.account, changed)
+        second = self.repo.ingest(self.account, replace(changed, ingestion_id="correction-replay"))
+        self.assertEqual((first.outcome, first.observation_added), (ledger.IngestOutcome.CONFLICT, True))
+        self.assertEqual((second.outcome, second.observation_added), (ledger.IngestOutcome.CONFLICT, False))
+        self.repo.close()
+        reopened = ledger.SQLiteDealRepository(self.path)
+        self.addCleanup(reopened.close)
+        loaded = reopened.get(self.account.mt5_account_id, original.deal_ticket)
+        self.assertEqual(loaded, original)
+        self.assertEqual(str(loaded.volume), "0.1500")
+        self.assertEqual(reopened.ingest(self.account, loaded).outcome, ledger.IngestOutcome.DUPLICATE)
+        self.assertFalse(reopened.ingest(self.account, changed).observation_added)
+        observations = reopened.list_observations(self.account.mt5_account_id, original.deal_ticket)
+        self.assertEqual(len(observations), 1)
+        self.assertEqual((observations[0].raw_payload_json, observations[0].ingestion_id),
+                         (changed.raw_payload_json, "correction"))
 
 
 if __name__ == "__main__":

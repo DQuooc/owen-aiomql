@@ -24,7 +24,8 @@ break Invalid arguments
   I --> App : raise TypeError / ValueError (no report)
 end
 
-I -> I : Compare source.broker_namespace with expected
+I -> I : Compare source.broker_namespace with expectedList all installed skills from mattpocock/skills.
+Explain how to invoke each skill.
 break Configured namespace mismatch before fetch
   I --> App : FAILED / ACCOUNT_BEFORE_FETCH\nNo fetch or write
 end
