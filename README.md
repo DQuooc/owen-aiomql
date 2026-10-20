@@ -1,76 +1,81 @@
-# aiomql
+<p align="center">
+  <img src="docs/images/owen.png" alt="owen-aiomql" width="100%">
+</p>
 
-![aiomql](docs/images/cover.png)
+<h1 align="center">owen-aiomql</h1>
 
-**Asynchronous MetaTrader 5 Library & Algorithmic Trading Framework**
+<p align="center">
+  <strong>Asynchronous Python Library for MetaTrader 5 and Algorithmic Trading</strong>
+</p>
 
-![PyPI Version](https://img.shields.io/pypi/v/aiomql)
-![Python](https://img.shields.io/pypi/pyversions/aiomql)
-![License](https://img.shields.io/github/license/ichinga-samuel/aiomql?style=plastic)
-![GitHub Issues](https://img.shields.io/github/issues/ichinga-samuel/aiomql?style=plastic)
-
----
+<p align="center">
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-%3E%3D3.13-blue" alt="Python >= 3.13"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
+  <a href="https://github.com/DQuooc/owen-aiomql/stargazers"><img src="https://img.shields.io/github/stars/DQuooc/owen-aiomql" alt="GitHub stars"></a>
+  <a href="https://github.com/DQuooc/owen-aiomql/issues"><img src="https://img.shields.io/github/issues/DQuooc/owen-aiomql" alt="GitHub issues"></a>
+</p>
 
 ## Overview
 
-**aiomql** is a Python framework for building algorithmic trading bots on top of MetaTrader 5.
-It wraps every MT5 API call in an async-friendly interface and provides high-level abstractions
-for strategies, risk management, trade execution, session management, and position tracking —
-so you can focus on your trading logic instead of boilerplate.
+**owen-aiomql** provides an asynchronous interface to MetaTrader 5 and a framework for building algorithmic trading bots. It combines market-data access, reusable strategies, order execution, position management, trading sessions, and risk and money management.
 
----
+The repository extends the upstream [aiomql](https://github.com/Ichinga-Samuel/aiomql) project. Its Python distribution and import package remain **`aiomql`**. Use the low-level MetaTrader interface directly, or compose symbols, traders, and strategies into a bot.
 
 ## Key Features
 
-- **Async-first MT5 interface** — every MT5 function wrapped with `asyncio.to_thread` and automatic reconnection
-- **Full synchronous API** — every async class has a sync counterpart for scripts and notebooks
-- **Bot orchestrator** — run multiple strategies on multiple instruments concurrently via thread-pool executors
-- **Strategy base class** — define `trade()`, set parameters, and let the framework handle the execution loop
-- **Session management** — restrict trading to specific time windows (London, New York, Tokyo, etc.)
-- **Risk & money management** — built-in `RAM` (Risk Assessment & Money) manager
-- **Trade recording** — persist results to CSV, JSON, or SQLite
-- **Position tracking** — monitor open positions with trailing stops, extending take-profits, and custom tracking functions
-- **Technical analysis** — built-in pandas-ta integration plus optional TA-Lib support
-- **Multi-process execution** — run independent bots in parallel with `Bot.process_pool()`
-- **JSON configuration** — centralise credentials and settings in `aiomql.json`
-- **Contributed extensions** — pre-built traders (`SimpleTrader`, `ScalpTrader`), strategies (`Chaos`), and specialised symbols (`ForexSymbol`)
-
----
+- **MetaTrader 5 interfaces** — asynchronous terminal calls, plus `MetaTraderSync` and selected synchronous trading components.
+- **Bot orchestration** — run strategies across instruments with thread-pool execution, coroutine tasks, and independent bots through `Bot.process_pool()`.
+- **Reusable strategies** — implement `Strategy.trade()` with configurable parameters and a session-aware execution loop.
+- **Market data** — retrieve symbol information, candles, ticks, market depth, and trading history.
+- **Orders and positions** — check and send orders, estimate margin and profit, query positions, and close trades.
+- **Risk and money management** — `RAM` provides risk amounts, risk-to-reward settings, and position-limit checks for use in trading logic.
+- **Trading sessions and tracking** — schedule trading in UTC windows, track strategy state, and attach position callbacks such as profit exits and take-profit extensions.
+- **Trade records** — save results to CSV, JSON, or SQLite; `aiomql.ledger` provides explicit deal-history ingestion and account-scoped SQLite storage.
+- **Technical analysis** — pandas-backed candles expose bundled pandas-ta-classic indicators with optional TA-Lib support.
+- **Configuration and extensions** — share JSON or programmatic settings through `Config`, and build on `ForexSymbol`, `SimpleTrader`, `ScalpTrader`, and other contrib components.
 
 ## Requirements
 
-- **Python ≥ 3.13**
-- **Windows** (MetaTrader 5 terminal requirement)
-- A MetaTrader 5 trading account
+- **Python 3.13 or later**, as declared in `pyproject.toml`.
+- **64-bit Windows** for the native `MetaTrader5` Python dependency; the repository lockfile contains Windows x86-64 wheels for it.
+- A locally installed **MetaTrader 5 desktop terminal** and a broker trading account.
+- Terminal permissions that allow Python trading when running order-execution examples.
 
----
+See the official [MetaTrader 5 Python integration guide](https://www.mql5.com/en/docs/python_metatrader5) for terminal integration details.
 
 ## Installation
 
-```bash
-pip install aiomql
+Install this repository from source in a virtual environment:
+
+```powershell
+git clone https://github.com/DQuooc/owen-aiomql.git
+cd owen-aiomql
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install .
 ```
 
-**Optional extras:**
+The installed distribution is named `aiomql`. Source installation selects the code in this repository.
 
-```bash
-# TA-Lib technical indicators
-pip install aiomql[talib]
+Optional extras declared in `pyproject.toml` can be installed from the same checkout:
 
-# Optional (Cython, Numba, tqdm)
-pip install aiomql[optional]
+```powershell
+# TA-Lib indicators
+python -m pip install ".[talib]"
 
-# Both
-pip install aiomql[all]
+# Cython, Numba, and tqdm
+python -m pip install ".[optional]"
+
+# Both sets of optional dependencies
+python -m pip install ".[all]"
 ```
-
----
 
 ## Quick Start
 
 ### Configuration
 
-Create an `aiomql.json` file in your project root:
+Create `aiomql.json` in the directory from which you run your application:
 
 ```json
 {
@@ -80,258 +85,268 @@ Create an `aiomql.json` file in your project root:
 }
 ```
 
-All settings can also be set programmatically via the singleton `Config` class:
+Alternatively, configure the shared `Config` instance before constructing trading components:
 
 ```python
 from aiomql import Config
 
-config = Config(login=12345678, password="your_password", server="YourBroker-Demo")
+config = Config(
+    login=12345678,
+    password="your_password",
+    server="YourBroker-Demo",
+)
 ```
 
-### Using the MetaTrader Interface
+Programmatic values override file settings. Set `path` to your terminal executable if needed, and use `root` or `config_file` to select a different configuration location. Keep account credentials out of version control.
+
+### MetaTrader Interface
+
+With configuration in place, use the asynchronous interface to read account and symbol information:
 
 ```python
 import asyncio
+
 from aiomql import MetaTrader
 
 
 async def main():
     async with MetaTrader() as mt5:
-        # Account information
         account = await mt5.account_info()
+        if account is None:
+            raise RuntimeError(f"Unable to read account information: {mt5.error}")
         print(account)
 
-        # Available symbols
         symbols = await mt5.symbols_get()
-        print(f"{len(symbols)} symbols available")
+        print(f"{len(symbols or ())} symbols available")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
----
+The context manager initializes the terminal, attempts login using `Config`, and shuts down the connection on exit.
 
 ## Building a Trading Bot
 
 ### 1. Define a Strategy
 
-Subclass `Strategy` and implement the `trade()` method. Parameters declared in the
-`parameters` dict become instance attributes and can be overridden at construction time.
+Subclass `Strategy` and implement one trading iteration in `trade()`. The framework calls it repeatedly while the strategy is running and checks its sessions before each iteration. Entries in `parameters` are accessible as attributes and can be overridden with `params`.
+
+Save this example as `ema_crossover.py`. It checks the last two completed candles for an EMA crossover and delegates execution to `ScalpTrader`:
 
 ```python
-# strategies/ema_crossover.py
-from aiomql import Strategy, ForexSymbol, TimeFrame, Tracker, OrderType, Sessions, Trader, ScalpTrader
+from aiomql import (
+    ForexSymbol, OrderType, ScalpTrader, Sessions, Strategy, TimeFrame, Tracker,
+)
 
 
 class EMAXOver(Strategy):
-    ttf: TimeFrame
-    tcc: int
-    fast_ema: int
-    slow_ema: int
-    tracker: Tracker
-    interval: TimeFrame
-    timeout: int
-
     parameters = {
-        "ttf": TimeFrame.H1,
-        "tcc": 3000,
-        "fast_ema": 34,
-        "slow_ema": 55,
+        "timeframe": TimeFrame.H1,
+        "count": 200,
+        "fast_ema": 20,
+        "slow_ema": 50,
         "interval": TimeFrame.M15,
-        "timeout": 3 * 60 * 60,
     }
 
-    def __init__(self, *, symbol: ForexSymbol, params: dict | None = None,
-                 trader: Trader = None, sessions: Sessions = None,
-                 name: str = "EMAXOver"):
-        super().__init__(symbol=symbol, params=params, sessions=sessions, name=name)
+    def __init__(self, *, symbol: ForexSymbol, params=None, sessions: Sessions = None):
+        super().__init__(symbol=symbol, params=params, sessions=sessions)
+        self.trader = ScalpTrader(symbol=symbol)
         self.tracker = Tracker(snooze=self.interval.seconds)
-        self.trader = trader or ScalpTrader(symbol=self.symbol)
-
-    async def find_entry(self):
-        candles = await self.symbol.copy_rates_from_pos(
-            timeframe=self.ttf, count=self.tcc
-        )
-        candles.ta.ema(length=self.fast_ema, append=True)
-        candles.ta.ema(length=self.slow_ema, append=True)
-        candles.rename(
-            **{f"EMA_{self.fast_ema}": "fast_ema",
-               f"EMA_{self.slow_ema}": "slow_ema"},
-            inplace=True,
-        )
-
-        fas = candles.ta_lib.above(candles.fast_ema, candles.slow_ema)
-        fbs = candles.ta_lib.below(candles.fast_ema, candles.slow_ema)
-
-        if fas.iloc[-1]:
-            self.tracker.update(order_type=OrderType.BUY, snooze=self.timeout)
-        elif fbs.iloc[-1]:
-            self.tracker.update(order_type=OrderType.SELL, snooze=self.timeout)
-        else:
-            self.tracker.update(order_type=None, snooze=self.interval.seconds)
 
     async def trade(self):
-        await self.find_entry()
+        candles = await self.symbol.copy_rates_from_pos(
+            timeframe=self.timeframe, count=self.count, start_position=1,
+        )
+        if len(candles) < max(self.fast_ema, self.slow_ema) + 2:
+            await self.sleep(secs=self.interval.seconds)
+            return
+
+        fast = candles.ta.ema(length=self.fast_ema, talib=False)
+        slow = candles.ta.ema(length=self.slow_ema, talib=False)
+        direction = None
+        if fast.iloc[-2] <= slow.iloc[-2] and fast.iloc[-1] > slow.iloc[-1]:
+            direction = OrderType.BUY
+        elif fast.iloc[-2] >= slow.iloc[-2] and fast.iloc[-1] < slow.iloc[-1]:
+            direction = OrderType.SELL
+        self.tracker.update(order_type=direction)
+
         if self.tracker.order_type is None:
-            await self.sleep(secs=self.tracker.snooze)
-        else:
-            await self.trader.place_trade(
-                order_type=self.tracker.order_type, parameters=self.parameters
-            )
-            await self.delay(secs=self.tracker.snooze)
+            await self.sleep(secs=self.interval.seconds)
+            return
+
+        await self.trader.place_trade(
+            order_type=self.tracker.order_type, parameters=self.parameters,
+        )
+        await self.delay(secs=self.timeframe.seconds)
 ```
 
-### 2. Wire It Up with a Bot
+This example uses the bundled EMA implementation without requiring TA-Lib. `ScalpTrader` defaults to the symbol's minimum volume and places orders without stop-loss or take-profit levels. Use a demo account for the tutorial; adapt execution and position management before applying your own trading rules. `SimpleTrader` accepts a stop-loss price, and custom `Trader` subclasses can use `RAM` for sizing.
+
+### 2. Run the Strategy with a Bot
+
+Save this as `bot.py` alongside `ema_crossover.py`. Use your broker's exact symbol names:
 
 ```python
 import logging
-from aiomql import Bot, ForexSymbol, OpenPositionsTracker
-from strategies.ema_crossover import EMAXOver
 
-logging.basicConfig(level=logging.INFO)
+from aiomql import Bot, ForexSymbol
+from ema_crossover import EMAXOver
 
 
 def main():
-    symbols = [ForexSymbol(name=s) for s in ["EURUSD", "GBPUSD", "USDJPY"]]
-    strategies = [EMAXOver(symbol=sym) for sym in symbols]
+    logging.basicConfig(level=logging.INFO)
+    symbols = [ForexSymbol(name=name) for name in ("EURUSD", "GBPUSD", "USDJPY")]
+    strategies = [EMAXOver(symbol=symbol) for symbol in symbols]
 
     bot = Bot()
-    bot.add_strategies(strategies)
-
-    # Optionally track open positions on a separate thread
-    bot.add_coroutine(
-        coroutine=OpenPositionsTracker(autocommit=True).track,
-        on_separate_thread=True,
-    )
-
-    bot.execute()  # synchronous entry point (blocks until shutdown)
+    bot.add_strategies(strategies=strategies)
+    bot.execute()
 
 
 if __name__ == "__main__":
     main()
 ```
 
-> **Tip:** Use `await bot.start()` instead of `bot.execute()` if you're already inside an async context.
+Run it with `python bot.py`. `Bot.execute()` initializes the terminal and symbols, then runs the registered strategies through its executor until shutdown.
 
-### 3. Trading Sessions
+To run an optional position tracker, register its coroutine before `bot.execute()`:
 
-Restrict when a strategy trades by passing `Sessions`:
+```python
+from aiomql import OpenPositionsTracker
+
+tracker = OpenPositionsTracker(autocommit=True)
+bot.add_coroutine(coroutine=tracker.track, on_separate_thread=True)
+```
+
+The tracker processes `OpenPosition` objects registered in shared state; starting it alone does not attach tracking rules to every account position. See the [tracking APIs](docs/contrib/trackers/open_position.md) for registration and callbacks.
+
+`await bot.start()` is also available for asynchronous initialization. It calls the same blocking executor afterward, so it occupies the calling event loop while the bot runs.
+
+## Trading Sessions
+
+Pass `Sessions` to a strategy to limit trading to selected windows. Session checks use **UTC**; the labels below are illustrative fixed windows and do not adjust for daylight saving time.
 
 ```python
 from datetime import time
-from aiomql import Session, Sessions, ForexSymbol, Chaos
+
+from aiomql import ForexSymbol, Session, Sessions
+from ema_crossover import EMAXOver
 
 london = Session(name="London", start=time(8, 0), end=time(16, 0))
 new_york = Session(name="New York", start=time(13, 0), end=time(21, 0))
-
 sessions = Sessions(sessions=[london, new_york])
-strategy = Chaos(symbol=ForexSymbol(name="USDJPY"), sessions=sessions)
+
+strategy = EMAXOver(symbol=ForexSymbol(name="EURUSD"), sessions=sessions)
 ```
 
-### 4. Multi-Process Execution
+Sessions can also run configured start/end actions, including custom callbacks. See the [session reference](docs/lib/sessions.md) for details.
 
-Run completely independent bots in separate processes:
+## Concurrent and Multi-process Execution
+
+Within a bot, the executor runs strategies in worker threads, each asynchronous strategy using its own event loop. `Bot.add_coroutine()` and `Bot.add_function()` register additional work.
+
+For independent bots, `Bot.process_pool()` maps module-level callables to keyword-argument dictionaries. Keep the process-pool call inside a main guard on Windows:
 
 ```python
-from aiomql import Bot
+from aiomql import Bot, ForexSymbol
+from ema_crossover import EMAXOver
+
+
+def run_bot(*, symbol_name: str):
+    bot = Bot()
+    bot.add_strategy(strategy=EMAXOver(symbol=ForexSymbol(name=symbol_name)))
+    bot.execute()
 
 
 def run_forex():
-    bot = Bot()
-    # ... add forex strategies ...
-    bot.execute()
+    run_bot(symbol_name="EURUSD")
 
 
 def run_crypto():
-    bot = Bot()
-    # ... add crypto strategies ...
-    bot.execute()
+    run_bot(symbol_name="BTCUSD")
 
 
-Bot.process_pool(processes={run_forex: {}, run_crypto: {}}, num_workers=2)
+if __name__ == "__main__":
+    Bot.process_pool(
+        processes={run_forex: {}, run_crypto: {}},
+        num_workers=2,
+    )
 ```
 
----
+Each process initializes its own configuration and terminal connection. This helper schedules processes; configure account and terminal settings inside each worker when they differ.
 
 ## Project Structure
 
-```
+```text
 src/aiomql/
-├── core/               # Low-level infrastructure
-│   ├── _core.py        #   MT5 function definitions & async wrappers
-│   ├── meta_trader.py  #   MetaTrader singleton (init, login, symbol/order calls)
-│   ├── config.py       #   Singleton Config (JSON + programmatic settings)
-│   ├── constants.py    #   Enums (TimeFrame, OrderType, TradeAction, …)
-│   ├── models.py       #   Data models (SymbolInfo, AccountInfo, TradeRequest, …)
-│   ├── base.py         #   _Base metaclass (attribute helpers, MT5 access)
-│   ├── db.py           #   SQLite trade-results database
-│   ├── store.py        #   In-memory shared state store
-│   ├── state.py        #   State management
-│   ├── task_queue.py   #   Async task queue for scheduled work
-│   ├── errors.py       #   Error definitions
-│   ├── exceptions.py   #   Custom exceptions (OrderError, LoginError, …)
-│   └── sync/           #   Synchronous MetaTrader wrapper
-│
-├── lib/                # High-level trading components
-│   ├── bot.py          #   Bot orchestrator (strategy runner, process pool)
-│   ├── executor.py     #   Thread/task executor for strategies
-│   ├── strategy.py     #   Strategy base class (trade loop, sessions)
-│   ├── symbol.py       #   Symbol (market data, ticks, rates)
-│   ├── order.py        #   Order (check, send, margin, profit)
-│   ├── trader.py       #   Trader (place_trade, SL/TP management)
-│   ├── account.py      #   Account singleton
-│   ├── candle.py       #   Candles collection (DataFrame + TA)
-│   ├── ticks.py        #   Tick & Ticks (tick data collections)
-│   ├── positions.py    #   Position querying & management
-│   ├── history.py      #   Trade & order history
-│   ├── ram.py          #   RAM (Risk Assessment & Money) manager
-│   ├── sessions.py     #   Session & Sessions (time-window trading)
-│   ├── terminal.py     #   Terminal info wrapper
-│   ├── result.py       #   Trade result recording (CSV/JSON)
-│   ├── result_db.py    #   Trade result recording (SQLite)
-│   ├── trade_records.py#   Trade records management
-│   └── sync/           #   Synchronous mirrors of lib modules
-│
-├── contrib/            # Community extensions
-│   ├── strategies/     #   Chaos (random buy/sell demo)
-│   ├── symbols/        #   ForexSymbol (pip & volume calculations)
-│   ├── trackers/       #   Position & open-positions trackers
-│   ├── traders/        #   SimpleTrader, ScalpTrader
-│   └── utils/          #   StrategyTracker (Tracker)
-│
-├── ta_libs/            # Technical analysis (pandas-ta classic)
-└── utils/              # Decorators, price helpers, process pool
+├── __init__.py            # Public core, lib, contrib, and utility exports
+├── core/                  # Terminal integration and shared infrastructure
+│   ├── config.py          # JSON and programmatic configuration
+│   ├── meta_trader.py     # Asynchronous MetaTrader interface
+│   ├── volume.py          # Volume validation and rounding
+│   ├── db.py              # SQLite persistence helpers
+│   └── sync/              # Synchronous MetaTrader interface
+├── lib/                   # Trading framework
+│   ├── bot.py             # Bot startup and process pool
+│   ├── executor.py        # Thread and coroutine execution
+│   ├── strategy.py        # Strategy lifecycle and trade loop
+│   ├── symbol.py          # Instruments and market data
+│   ├── candle.py          # Candles and indicator access
+│   ├── order.py           # Order checks and submission
+│   ├── trader.py          # Execution and sizing helpers
+│   ├── positions.py       # Position queries and closing
+│   ├── ram.py             # Risk and money management
+│   ├── sessions.py        # Session windows and actions
+│   ├── result.py          # CSV, JSON, and SQLite result recording
+│   └── sync/              # Selected synchronous trading components
+├── contrib/               # Strategies, symbols, traders, and trackers
+├── ledger/                # Deal normalization, ingestion, and SQLite storage
+├── ta_libs/               # Bundled pandas-ta-classic implementation
+└── utils/                 # Decorators, price helpers, and process pools
 ```
-
----
 
 ## API Documentation
 
-See the full [API Reference](docs/toc.md) for detailed documentation of every module.
-
----
+Start with the [API Reference](docs/toc.md) for core, trading, contrib, and utility modules. The [tutorial](docs/tutorial.md), [examples](examples/), and [execution-flow overview](docs/code-reading/01-execution-flow-overview.md) provide additional usage and architecture context. Check source signatures when adapting examples.
 
 ## Testing
 
-```bash
-# Install dev dependencies
-pip install -e ".[dev]"
+The repository separates offline execution/ledger tests from terminal-connected pytest tests.
 
-# Run the test suite
-pytest tests
+### Offline Tests
+
+From the repository root, run the standard-library suite with fake SDK dependencies:
+
+```powershell
+python -B -m unittest discover -s tests/offline -p 'test_*.py' -v
 ```
 
----
+This command limits discovery to `tests/offline` and avoids the live pytest fixtures. See the [offline test guide](tests/offline/README.md).
+
+### Terminal-connected Tests
+
+Development dependencies, including `pytest` and `pytest-asyncio`, are declared in the `dev` dependency group. From the repository root, install the project in editable mode and install that group with [pip 25.1 or later](https://pip.pypa.io/en/stable/user_guide/#dependency-groups):
+
+```powershell
+python -m pip install -e .
+python -m pip install --group dev
+```
+
+Configure `aiomql.json` and a MetaTrader 5 terminal connected to a dedicated demo account before running:
+
+```powershell
+python -m pytest -c tests/pytest.ini tests/live
+```
+
+**Live tests can place trades, and their cleanup closes all open positions on the connected account.** Review `tests/live/conftest.py` before running them. Unrestricted `pytest tests` also discovers these fixtures.
 
 ## Contributing
 
-Pull requests are welcome. For major changes, please open an [issue](https://github.com/Ichinga-Samuel/aiomql/issues) first
-to discuss what you would like to change.
+Contributions, bug reports, documentation improvements, and pull requests are welcome. For significant changes, please open an [issue](https://github.com/DQuooc/owen-aiomql/issues) first to discuss the proposed direction.
 
----
+Submit contributions to [DQuooc/owen-aiomql](https://github.com/DQuooc/owen-aiomql) and follow the [Code of Conduct](CODE_OF_CONDUCT.md). This project builds on aiomql by Ichinga Samuel; upstream attribution and copyright are retained in the [license](LICENSE).
 
 ## License
 
 [MIT](LICENSE)
-
----
